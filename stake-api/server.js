@@ -111,6 +111,25 @@ async function initDb() {
     ON game_sessions (user_id, started_at DESC);
   `);
 
+  // Deposits and withdrawals — money in/out, separate from gambling P&L.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS transactions (
+      id           BIGSERIAL PRIMARY KEY,
+      tx_id        TEXT,
+      user_id      TEXT,
+      kind         TEXT,      -- 'deposit' | 'withdrawal'
+      amount       NUMERIC(20, 8),
+      currency     TEXT,
+      status       TEXT,
+      created_at   TIMESTAMPTZ,
+      recorded_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS transactions_user_tx_uniq
+    ON transactions (user_id, tx_id) WHERE tx_id IS NOT NULL;
+  `);
+
   // Balance snapshots over time. Balance moves independently of bets
   // (deposits, withdrawals, native-game play), so it gets its own table.
   await pool.query(`
@@ -287,6 +306,46 @@ app.post("/game-session", requireToken, async (req, res) => {
   } catch (err) {
     console.error("game-session upsert failed:", err.message);
     res.status(500).json({ error: "upsert_failed" });
+  }
+});
+
+// --- ingest a deposit/withdrawal ---
+app.post("/transaction", requireToken, async (req, res) => {
+  const b = req.body || {};
+  try {
+    const result = await pool.query(
+      `INSERT INTO transactions
+         (tx_id, user_id, kind, amount, currency, status, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (user_id, tx_id) WHERE tx_id IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [
+        b.txId ?? null,
+        b.userId ?? null,
+        b.kind ?? null,
+        numOrNull(b.amount),
+        b.currency ?? null,
+        b.status ?? null,
+        b.createdAt ? new Date(b.createdAt) : null,
+      ]
+    );
+    res.json({ ok: true, inserted: result.rowCount });
+  } catch (err) {
+    console.error("transaction insert failed:", err.message);
+    res.status(500).json({ error: "insert_failed" });
+  }
+});
+
+app.get("/transactions", requireToken, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  try {
+    const r = await pool.query(
+      `SELECT * FROM transactions ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, count: r.rowCount, transactions: r.rows });
+  } catch (err) {
+    res.status(500).json({ error: "query_failed" });
   }
 });
 
