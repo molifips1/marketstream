@@ -41,6 +41,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS bets (
       id            BIGSERIAL PRIMARY KEY,
       bet_id        TEXT,
+      user_id       TEXT,
       username      TEXT,
       game          TEXT,
       currency      TEXT,
@@ -55,10 +56,13 @@ async function initDb() {
       created_at    TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  // De-dupe protection: the same spin shouldn't insert twice on retry.
+  // Migration for databases created before user_id existed.
+  await pool.query(`ALTER TABLE bets ADD COLUMN IF NOT EXISTS user_id TEXT;`);
+  // De-dupe protection: same spin from same user shouldn't insert twice.
+  await pool.query(`DROP INDEX IF EXISTS bets_bet_id_uniq;`);
   await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS bets_bet_id_uniq
-    ON bets (bet_id) WHERE bet_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS bets_user_bet_uniq
+    ON bets (user_id, bet_id) WHERE bet_id IS NOT NULL;
   `);
   console.log("DB ready");
 }
@@ -91,13 +95,14 @@ app.post("/bets", requireToken, async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO bets
-         (bet_id, username, game, currency, amount, payout, multiplier,
+         (bet_id, user_id, username, game, currency, amount, payout, multiplier,
           profit, is_free_game, won, demo, placed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       ON CONFLICT (bet_id) WHERE bet_id IS NOT NULL DO NOTHING
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (user_id, bet_id) WHERE bet_id IS NOT NULL DO NOTHING
        RETURNING id`,
       [
         b.betId ?? null,
+        b.userId ?? null,
         b.username ?? null,
         b.game ?? null,
         b.currency ?? null,
