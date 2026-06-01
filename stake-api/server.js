@@ -66,49 +66,43 @@ async function initDb() {
     ON bets (user_id, bet_id) WHERE bet_id IS NOT NULL;
   `);
 
-  // Live per-session summary, updated on every (non-duplicate) bet.
+  // Unified per-session table holding EVERY game played. Engine games fill the
+  // per-bet columns (bet_count, total_wagered, total_payout, pnl); native and
+  // third-party games fill the balance-delta columns (net, start/end balance).
+  // Columns not applicable to a given game type are left null.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       session_id     TEXT PRIMARY KEY,
       user_id        TEXT,
       username       TEXT,
-      game           TEXT,
-      currency       TEXT,
-      bet_count      INTEGER DEFAULT 0,
-      total_wagered  NUMERIC(20, 8) DEFAULT 0,
-      total_payout   NUMERIC(20, 8) DEFAULT 0,
-      pnl            NUMERIC(20, 8) DEFAULT 0,
-      started_at     TIMESTAMPTZ DEFAULT NOW(),
-      updated_at     TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS sessions_user_time
-    ON sessions (user_id, updated_at DESC);
-  `);
-
-  // Universal game sessions: one row per game opened, for ALL providers
-  // (native, third-party, engine). Holds session-level net from balance
-  // deltas — no per-bet detail, but every game is represented here.
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS game_sessions (
-      gs_id          TEXT PRIMARY KEY,
-      user_id        TEXT,
       provider       TEXT,
       game           TEXT,
       currency       TEXT,
       tier           TEXT,
       demo           BOOLEAN,
+      -- per-bet detail (engine games)
+      bet_count      INTEGER DEFAULT 0,
+      total_wagered  NUMERIC(20, 8) DEFAULT 0,
+      total_payout   NUMERIC(20, 8) DEFAULT 0,
+      pnl            NUMERIC(20, 8) DEFAULT 0,
+      -- balance-delta detail (native / third-party games)
       net            NUMERIC(20, 8),
       start_balance  NUMERIC(20, 8),
       end_balance    NUMERIC(20, 8),
-      started_at     TIMESTAMPTZ,
+      started_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // Migrate older sessions tables that lack the newer columns.
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS provider TEXT;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tier TEXT;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS demo BOOLEAN;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS net NUMERIC(20, 8);`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_balance NUMERIC(20, 8);`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_balance NUMERIC(20, 8);`);
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS game_sessions_user_time
-    ON game_sessions (user_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS sessions_user_time
+    ON sessions (user_id, updated_at DESC);
   `);
 
   // Deposits and withdrawals — money in/out, separate from gambling P&L.
@@ -273,23 +267,29 @@ app.get("/bets", requireToken, async (req, res) => {
   }
 });
 
-// --- upsert a universal game session (all providers) ---
+// --- upsert a game session (all providers) into the unified sessions table ---
 app.post("/game-session", requireToken, async (req, res) => {
   const b = req.body || {};
-  if (!b.gsId) return res.json({ ok: true, updated: 0 });
+  const sid = b.gsId || b.sessionId;
+  if (!sid) return res.json({ ok: true, updated: 0 });
   try {
     await pool.query(
-      `INSERT INTO game_sessions
-         (gs_id, user_id, provider, game, currency, tier, demo,
+      `INSERT INTO sessions
+         (session_id, user_id, provider, game, currency, tier, demo,
           net, start_balance, end_balance, started_at, updated_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
-       ON CONFLICT (gs_id) DO UPDATE SET
-         net          = EXCLUDED.net,
-         end_balance  = EXCLUDED.end_balance,
-         game         = COALESCE(EXCLUDED.game, game_sessions.game),
-         updated_at   = NOW()`,
+       ON CONFLICT (session_id) DO UPDATE SET
+         net           = EXCLUDED.net,
+         start_balance = COALESCE(sessions.start_balance, EXCLUDED.start_balance),
+         end_balance   = EXCLUDED.end_balance,
+         provider      = COALESCE(EXCLUDED.provider, sessions.provider),
+         game          = COALESCE(EXCLUDED.game, sessions.game),
+         currency      = COALESCE(EXCLUDED.currency, sessions.currency),
+         tier          = COALESCE(EXCLUDED.tier, sessions.tier),
+         demo          = COALESCE(EXCLUDED.demo, sessions.demo),
+         updated_at    = NOW()`,
       [
-        b.gsId,
+        sid,
         b.userId ?? null,
         b.provider ?? null,
         b.game ?? null,
@@ -349,14 +349,16 @@ app.get("/transactions", requireToken, async (req, res) => {
   }
 });
 
+// Alias: /game-sessions now reads the unified sessions table (kept for
+// backward compatibility — every game lives in `sessions`).
 app.get("/game-sessions", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   try {
     const r = await pool.query(
-      `SELECT * FROM game_sessions ORDER BY started_at DESC LIMIT $1`,
+      `SELECT * FROM sessions ORDER BY updated_at DESC LIMIT $1`,
       [limit]
     );
-    res.json({ ok: true, count: r.rowCount, gameSessions: r.rows });
+    res.json({ ok: true, count: r.rowCount, sessions: r.rows });
   } catch (err) {
     res.status(500).json({ error: "query_failed" });
   }
