@@ -4,6 +4,21 @@ const { Pool } = require("pg");
 const app = express();
 app.use(express.json({ limit: "256kb" }));
 
+// --- small helpers (hoisted: used across many routes) ---
+function numOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Clamp text inputs so a client can't stuff a megabyte into a TEXT column.
+// Parameterised queries stop injection, not oversized payloads.
+function txt(v, max = 200) {
+  if (v == null) return null;
+  const s = String(v);
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 // --- config from environment ---
 // DATABASE_URL is provided by Railway when you reference the Postgres service.
 // INGEST_TOKEN is a shared secret you set yourself; the extension must send it.
@@ -100,6 +115,8 @@ async function initDb() {
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS net NUMERIC(20, 8);`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS start_balance NUMERIC(20, 8);`);
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS end_balance NUMERIC(20, 8);`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ended BOOLEAN DEFAULT FALSE;`);
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;`);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS sessions_user_time
     ON sessions (user_id, updated_at DESC);
@@ -162,8 +179,41 @@ function requireToken(req, res, next) {
   next();
 }
 
+// --- lightweight per-token rate limit (no external dependency) ---
+// Sliding window: cap requests per token per window. A few hundred/min is far
+// more than legitimate use, but stops a token holder hammering thousands/sec.
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = 600; // requests per token per minute
+const rateHits = new Map(); // token -> [timestamps]
+function rateLimit(req, res, next) {
+  const auth = req.get("Authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "anon";
+  const now = Date.now();
+  const arr = (rateHits.get(token) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (arr.length >= RATE_MAX) {
+    res.set("Retry-After", "60");
+    return res.status(429).json({ error: "rate_limited" });
+  }
+  arr.push(now);
+  rateHits.set(token, arr);
+  next();
+}
+// Periodically clear empty buckets so the map doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateHits) {
+    const kept = v.filter((t) => now - t < RATE_WINDOW_MS);
+    if (kept.length) rateHits.set(k, kept);
+    else rateHits.delete(k);
+  }
+}, RATE_WINDOW_MS).unref?.();
+
 app.get("/", (_req, res) => res.json({ ok: true, service: "stake-tracker-api" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Rate-limit everything below this line (health/root above are exempt so
+// uptime checks and the connection test aren't throttled).
+app.use(rateLimit);
 
 // --- ingest one bet ---
 app.post("/bets", requireToken, async (req, res) => {
@@ -177,12 +227,12 @@ app.post("/bets", requireToken, async (req, res) => {
        ON CONFLICT (user_id, bet_id) WHERE bet_id IS NOT NULL DO NOTHING
        RETURNING id`,
       [
-        b.betId ?? null,
-        b.userId ?? null,
-        b.sessionId ?? null,
-        b.username ?? null,
-        b.game ?? null,
-        b.currency ?? null,
+        txt(b.betId, 80),
+        txt(b.userId, 64),
+        txt(b.sessionId, 64),
+        txt(b.username, 80),
+        txt(b.game, 120),
+        txt(b.currency, 16),
         numOrNull(b.amount),
         numOrNull(b.payout),
         numOrNull(b.multiplier),
@@ -254,15 +304,20 @@ app.post("/balance", requireToken, async (req, res) => {
 });
 
 // --- simple read-back for sanity checking ---
+// Optional ?user_id= filters to one user's rows (multi-tenant reads).
 app.get("/bets", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const userId = txt(req.query.user_id, 64);
   try {
-    const r = await pool.query(
-      `SELECT * FROM bets ORDER BY id DESC LIMIT $1`,
-      [limit]
-    );
+    const r = userId
+      ? await pool.query(
+          `SELECT * FROM bets WHERE user_id = $1 ORDER BY id DESC LIMIT $2`,
+          [userId, limit]
+        )
+      : await pool.query(`SELECT * FROM bets ORDER BY id DESC LIMIT $1`, [limit]);
     res.json({ ok: true, count: r.rowCount, bets: r.rows });
   } catch (err) {
+    console.error("bets query failed:", err.message);
     res.status(500).json({ error: "query_failed" });
   }
 });
@@ -276,8 +331,8 @@ app.post("/game-session", requireToken, async (req, res) => {
     await pool.query(
       `INSERT INTO sessions
          (session_id, user_id, provider, game, currency, tier, demo,
-          net, start_balance, end_balance, started_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+          net, start_balance, end_balance, started_at, ended, ended_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
        ON CONFLICT (session_id) DO UPDATE SET
          net           = EXCLUDED.net,
          start_balance = COALESCE(sessions.start_balance, EXCLUDED.start_balance),
@@ -287,19 +342,23 @@ app.post("/game-session", requireToken, async (req, res) => {
          currency      = COALESCE(EXCLUDED.currency, sessions.currency),
          tier          = COALESCE(EXCLUDED.tier, sessions.tier),
          demo          = COALESCE(EXCLUDED.demo, sessions.demo),
+         ended         = sessions.ended OR EXCLUDED.ended,
+         ended_at      = COALESCE(sessions.ended_at, EXCLUDED.ended_at),
          updated_at    = NOW()`,
       [
-        sid,
-        b.userId ?? null,
-        b.provider ?? null,
-        b.game ?? null,
-        b.currency ?? null,
-        b.tier ?? null,
+        txt(sid, 64),
+        txt(b.userId, 64),
+        txt(b.provider, 80),
+        txt(b.game, 120),
+        txt(b.currency, 16),
+        txt(b.tier, 24),
         b.demo ?? null,
         numOrNull(b.net),
         numOrNull(b.startBalance),
         numOrNull(b.endBalance),
         b.startedAt ? new Date(b.startedAt) : null,
+        !!b.ended,
+        b.endedAt ? new Date(b.endedAt) : null,
       ]
     );
     res.json({ ok: true, updated: 1 });
@@ -338,13 +397,17 @@ app.post("/transaction", requireToken, async (req, res) => {
 
 app.get("/transactions", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const userId = txt(req.query.user_id, 64);
   try {
-    const r = await pool.query(
-      `SELECT * FROM transactions ORDER BY id DESC LIMIT $1`,
-      [limit]
-    );
+    const r = userId
+      ? await pool.query(
+          `SELECT * FROM transactions WHERE user_id = $1 ORDER BY id DESC LIMIT $2`,
+          [userId, limit]
+        )
+      : await pool.query(`SELECT * FROM transactions ORDER BY id DESC LIMIT $1`, [limit]);
     res.json({ ok: true, count: r.rowCount, transactions: r.rows });
   } catch (err) {
+    console.error("transactions query failed:", err.message);
     res.status(500).json({ error: "query_failed" });
   }
 });
@@ -353,48 +416,54 @@ app.get("/transactions", requireToken, async (req, res) => {
 // backward compatibility — every game lives in `sessions`).
 app.get("/game-sessions", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const userId = txt(req.query.user_id, 64);
   try {
-    const r = await pool.query(
-      `SELECT * FROM sessions ORDER BY updated_at DESC LIMIT $1`,
-      [limit]
-    );
+    const r = userId
+      ? await pool.query(
+          `SELECT * FROM sessions WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+          [userId, limit]
+        )
+      : await pool.query(`SELECT * FROM sessions ORDER BY updated_at DESC LIMIT $1`, [limit]);
     res.json({ ok: true, count: r.rowCount, sessions: r.rows });
   } catch (err) {
+    console.error("game-sessions query failed:", err.message);
     res.status(500).json({ error: "query_failed" });
   }
 });
 
 app.get("/sessions", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const userId = txt(req.query.user_id, 64);
   try {
-    const r = await pool.query(
-      `SELECT * FROM sessions ORDER BY updated_at DESC LIMIT $1`,
-      [limit]
-    );
+    const r = userId
+      ? await pool.query(
+          `SELECT * FROM sessions WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+          [userId, limit]
+        )
+      : await pool.query(`SELECT * FROM sessions ORDER BY updated_at DESC LIMIT $1`, [limit]);
     res.json({ ok: true, count: r.rowCount, sessions: r.rows });
   } catch (err) {
+    console.error("sessions query failed:", err.message);
     res.status(500).json({ error: "query_failed" });
   }
 });
 
 app.get("/balance", requireToken, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+  const userId = txt(req.query.user_id, 64);
   try {
-    const r = await pool.query(
-      `SELECT * FROM balances ORDER BY id DESC LIMIT $1`,
-      [limit]
-    );
+    const r = userId
+      ? await pool.query(
+          `SELECT * FROM balances WHERE user_id = $1 ORDER BY id DESC LIMIT $2`,
+          [userId, limit]
+        )
+      : await pool.query(`SELECT * FROM balances ORDER BY id DESC LIMIT $1`, [limit]);
     res.json({ ok: true, count: r.rowCount, balances: r.rows });
   } catch (err) {
+    console.error("balance query failed:", err.message);
     res.status(500).json({ error: "query_failed" });
   }
 });
-
-function numOrNull(v) {
-  if (v == null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
 
 initDb()
   .then(() => {
